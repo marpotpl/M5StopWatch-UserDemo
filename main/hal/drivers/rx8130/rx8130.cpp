@@ -101,18 +101,35 @@ void RX8130_Class::setTime(struct tm *time)
 {
     uint8_t rbuf = 0;
 
-    time->tm_year -= 100;
+    // struct tm przechowuje rok jako liczbę lat od 1900.
+    // Dla 2026: tm_year = 126.
+    // RX8130 przechowuje tylko dwie ostatnie cyfry roku.
+    //
+    // Nie modyfikujemy time->tm_year, ponieważ struktura należy
+    // do kodu wywołującego.
+    const int rtc_year = (time->tm_year + 1900) % 100;
 
     // set STOP bit before changing clock/calendar
     i2c_bus_read_byte(_i2c_dev, RX8130_REG_CTRL0, &rbuf);
     rbuf = rbuf | RX8130_BIT_CTRL_STOP;
     i2c_bus_write_byte(_i2c_dev, RX8130_REG_CTRL0, rbuf);
 
-    uint8_t date[7] = {dec2bcd(time->tm_sec),       dec2bcd(time->tm_min),  dec2bcd(time->tm_hour),
-                       dec2bcd(time->tm_wday),      dec2bcd(time->tm_mday), dec2bcd(time->tm_mon + 1),
-                       dec2bcd(time->tm_year % 100)};
+    uint8_t date[7] = {
+        dec2bcd(time->tm_sec),
+        dec2bcd(time->tm_min),
+        dec2bcd(time->tm_hour),
+        dec2bcd(time->tm_wday),
+        dec2bcd(time->tm_mday),
+        dec2bcd(time->tm_mon + 1),
+        dec2bcd(rtc_year)
+    };
 
-    i2c_bus_write_bytes(_i2c_dev, RX8130_REG_SEC, 7, date);
+    i2c_bus_write_bytes(
+        _i2c_dev,
+        RX8130_REG_SEC,
+        7,
+        date
+    );
 
     // clear STOP bit after changing clock/calendar
     i2c_bus_read_byte(_i2c_dev, RX8130_REG_CTRL0, &rbuf);

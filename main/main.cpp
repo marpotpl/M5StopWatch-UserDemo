@@ -11,6 +11,7 @@
 #include <hal/hal.h>
 #include <lv_demos.h>
 #include <apps/common/audio/audio.h>
+#include <hal/ha_wifi.h>
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit;
@@ -23,6 +24,9 @@ extern "C" void app_main(void)
 
     // HAL init
     GetHAL().init();
+
+    // Wi-Fi / Home Assistant connectivity
+    ha_wifi::init();
 
     // Setup ui hal
     ui_hal::on_delay([](uint32_t ms) { GetHAL().delay(ms); });

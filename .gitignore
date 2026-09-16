@@ -63,3 +63,4 @@ obj/
 
 sdkconfig
 sdkconfig.old
+main/hal/ha_secrets.h
