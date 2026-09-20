@@ -1,0 +1,4 @@
+#pragma once
+
+#define HA_WIFI_SSID "YOUR_WIFI_SSID"
+#define HA_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
