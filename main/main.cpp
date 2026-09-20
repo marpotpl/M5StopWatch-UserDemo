@@ -13,6 +13,7 @@
 #include <apps/common/audio/audio.h>
 #include <hal/ha_wifi.h>
 #include <hal/ha_client.h>
+#include <hal/ha_ota.h>
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit;
@@ -22,6 +23,9 @@ extern "C" void app_main(void)
     // Setup logger
     mclog::set_level(mclog::level_info);
     mclog::set_time_format(mclog::time_format_unix_milliseconds);
+
+    // Start the OTA first-boot check before HAL setup. Normal boots do not wait.
+    ha_ota::init();
 
     // HAL init
     GetHAL().init();
@@ -46,9 +50,12 @@ extern "C" void app_main(void)
     GetMooncake().installApp(std::make_unique<AppSetup>());
     // GetMooncake().installApp(std::make_unique<AppTemplate>());
 
+    ha_ota::report_boot_ready();
+
     // Main loop
     while (1) {
         GetHAL().feedTheDog();
         GetMooncake().update();
+        ha_ota::heartbeat();
     }
 }

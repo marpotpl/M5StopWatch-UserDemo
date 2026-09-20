@@ -57,6 +57,34 @@ until another packet arrives, after its authentication timeout. When updating
 ESP-IDF, compare this local file with the new upstream `transport_ws.c` and
 remove the override if upstream includes the fix.
 
+### OTA foundation
+
+The existing `partitions.csv` already provides `otadata` and two 5056 KiB
+application slots. `sdkconfig.defaults` enables the ESP-IDF bootloader rollback
+option. After adding this option, flash the new bootloader and application once
+over USB; an application-only OTA cannot upgrade the installed bootloader.
+Keep the partition table unchanged so NVS and FAT storage retain their offsets.
+
+`ha_ota` logs the running and next OTA partitions. Only an OTA image in
+`PENDING_VERIFY` starts its 90-second self-test. The test waits for completed
+HAL/app setup, ten seconds of a responsive main UI loop, and five seconds of
+connected Wi-Fi. It then marks the image `VALID`. A failed or timed-out test
+requests rollback to the prior slot. Home Assistant availability is not a
+requirement. Normal boots do not wait for the self-test.
+
+The module exposes `ha_ota::start_update(url, ca_cert_pem)` for later use by a
+trusted local trigger. It currently has no UI or automatic trigger. The URL
+must use HTTPS and a private IPv4 address (10/8, 172.16/12, or 192.168/16).
+The default verifies the server with the ESP-IDF certificate bundle; for a
+Mac server using a private CA, the caller supplies that CA certificate and the
+server certificate needs the LAN IP in its subject alternative names. The download runs
+in a separate task, writes only to the inactive slot, reports status and
+progress through `ha_ota::status()`, and restarts only after image validation.
+The caller must limit the server and trigger to the trusted local network.
+The firmware binary currently includes the compiled HA token: never serve it
+over plain HTTP or expose it publicly. Do not put certificates' private keys,
+OTA credentials, or other secrets in tracked files.
+
 ### Tool Chains
 
 [ESP-IDF v5.5.4](https://docs.espressif.com/projects/esp-idf/en/v5.5.4/esp32s3/index.html)
