@@ -37,6 +37,25 @@ cp main/hal/ha_secrets.example.h main/hal/ha_secrets.h
 
 Replace the example placeholders in `ha_secrets.h` with your own network
 credentials. This file is ignored by Git; do not commit credentials.
+Also define `HA_ACCESS_TOKEN` there with a Home Assistant Long-Lived Access
+Token. The example header contains only a placeholder; never commit the real
+token.
+
+The first Home Assistant client stage connects to
+`ws://192.168.0.73:8123/api/websocket` after Wi-Fi obtains an IP address,
+authenticates with the token, and reconnects after transport failures. It does
+not fetch entities, call services, or change the UI. `auth_invalid` stops
+retries until the device restarts. This `ws://` endpoint sends the token without
+TLS; use it only on the intended local network.
+
+`components/tcp_transport/` overrides the ESP-IDF 5.5.4 component to fix
+WebSocket frames buffered during the HTTP Upgrade. Its `transport_ws.c` is
+copied from ESP-IDF 5.5.4 with only the buffered-read checks changed; the
+other transport sources and headers still come from the installed ESP-IDF.
+Without this fix, Home Assistant's `auth_required` frame can remain buffered
+until another packet arrives, after its authentication timeout. When updating
+ESP-IDF, compare this local file with the new upstream `transport_ws.c` and
+remove the override if upstream includes the fix.
 
 ### Tool Chains
 

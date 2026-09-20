@@ -29,7 +29,9 @@
 - Preferuj małe, czytelne zmiany i zachowuj istniejącą architekturę projektu. Nie modyfikuj plików niezwiązanych z zadaniem.
 - Zwracaj szczególną uwagę na rozmiary stosów FreeRTOS. Nie wykonuj ciężkich operacji bezpośrednio w callbackach systemowej pętli zdarzeń ESP-IDF.
 - RTC RX8130 przechowuje czas UTC; lokalną strefę czasu obsługuje system/HAL. Polska strefa to CET/CEST z automatyczną zmianą czasu.
-- Lokalna modyfikacja `managed_components/78__esp-wifi-connect/wifi_station.cc` przenosi `HandleScanResult()` do tasku `wifi_scan_result`. Jest krytyczna dla stabilności i obecnie nie jest śledzona przez Git. Nie nadpisuj jej ani nie usuwaj.
+- Poprawka `wifi_scan_result` jest śledzona w `vendor/78__esp-wifi-connect/wifi_station.cc` i wybierana przez `override_path`. Nie nadpisuj jej ani nie usuwaj.
+- `components/tcp_transport/` nadpisuje komponent ESP-IDF 5.5.4, aby odczytać ramkę WebSocket zbuforowaną przy HTTP Upgrade. Przy aktualizacji ESP-IDF porównaj lokalne `transport_ws.c` z upstreamem.
+- `ha_client` łączy się z lokalnym Home Assistant przez WebSocket i używa tokenu wyłącznie z ignorowanego `main/hal/ha_secrets.h`. Nigdy nie loguj tokenu; ciężką pracę wykonuj w tasku modułu, poza callbackami WebSocket.
 - Nie wykonuj `git commit` ani `git push` bez wyraźnego polecenia użytkownika.
 
 ## Obecny stan
@@ -38,4 +40,4 @@
 - Działa synchronizacja czasu systemowego do RX8130; poprawiono obsługę roku w sterowniku RX8130.
 - Rozwiązano stack overflow `sys_evt` podczas skanowania Wi-Fi przez uruchamianie `HandleScanResult()` w tasku `wifi_scan_result`.
 - Rozwiązano stack overflow `sys_evt` podczas uruchamiania NTP przez uruchamianie inicjalizacji w osobnym tasku.
-- Komunikacja z API Home Assistant nie została jeszcze zaimplementowana.
+- Pierwszy etap `ha_client` obejmuje połączenie WebSocket i autoryzację; obsługa encji, usług i UI pozostaje do wykonania.

@@ -41,6 +41,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.5.4
+  espressif/esp_websocket_client:
+    component_hash: dc00233af846f3a744ada283a300e0d586040aadc3ee67361645ecdce4523672
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.8.0
   espressif/i2c_bus:
     component_hash: 4e990dc11734316186b489b362c61d41f23f79d58bc169795cec215e528cba14
     dependencies:
@@ -64,8 +74,9 @@ direct_dependencies:
 - espressif/cmake_utilities
 - espressif/esp-dsp
 - espressif/esp_codec_dev
+- espressif/esp_websocket_client
 - espressif/i2c_bus
 - idf
-manifest_hash: 771c6f6cea33fa4ad845f43c1035e99b1f88241e756addce4c6d0cfe6e70ee2c
+manifest_hash: 2fcfa6f1cb86996768a638fe9675917b94cc623ec9114076fc5008941891afc8
 target: esp32s3
 version: 2.0.0
