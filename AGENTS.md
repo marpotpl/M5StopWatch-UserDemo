@@ -32,8 +32,10 @@
 - Poprawka `wifi_scan_result` jest śledzona w `vendor/78__esp-wifi-connect/wifi_station.cc` i wybierana przez `override_path`. Nie nadpisuj jej ani nie usuwaj.
 - `components/tcp_transport/` nadpisuje komponent ESP-IDF 5.5.4, aby odczytać ramkę WebSocket zbuforowaną przy HTTP Upgrade. Przy aktualizacji ESP-IDF porównaj lokalne `transport_ws.c` z upstreamem.
 - `ha_client` łączy się z lokalnym Home Assistant przez WebSocket i używa tokenu wyłącznie z ignorowanego `main/hal/ha_secrets.h`. Nigdy nie loguj tokenu; ciężką pracę wykonuj w tasku modułu, poza callbackami WebSocket.
-- `ha_ota` używa dwóch istniejących partycji OTA. Rollback bootloadera jest włączony przez `sdkconfig.defaults`; po jego pierwszym wdrożeniu wymagane jest flashowanie przez USB, ponieważ OTA aplikacji nie aktualizuje bootloadera. Nie zmieniaj `partitions.csv` bez wyraźnego polecenia.
+- `ha_ota` używa dwóch istniejących partycji OTA. Rollback bootloadera jest włączony przez `sdkconfig.defaults` i został już wgrany przez USB; OTA aplikacji nie aktualizuje bootloadera. Nie zmieniaj `partitions.csv` bez wyraźnego polecenia.
 - `ha_ota::start_update()` akceptuje tylko HTTPS pod prywatnym adresem IPv4 z weryfikacją certyfikatu i zapisuje do nieaktywnego slotu. Obraz firmware zawiera wkompilowany token HA, więc nie serwuj go przez zwykły HTTP ani publicznie; nie loguj URL zawierających dane uwierzytelniające.
+- Trigger OTA używa po uwierzytelnieniu HA wyłącznie subskrypcji eventu `m5stopwatch_ota_request`. Callback WebSocket przekazuje dane do tasku `ha_client`; pobieranie odbywa się w tasku `ha_ota`. Event zawiera `device_id`, `request_id`, URL, SHA-256 i rozmiar, ale nigdy CA ani token.
+- Lokalny publiczny certyfikat CA OTA umieszczaj tylko w ignorowanym `main/hal/ha_ota_ca.h`. Prywatne klucze i certyfikaty serwera przechowuj w ignorowanym `local_ota/`. Nie flashuj finalnego obrazu USB bez sprawdzenia, że CA jest osadzony; bez CA OTA celowo odmawia pracy.
 - Pierwszy start OTA pozostaje `PENDING_VERIFY` do zakończenia ograniczonego czasowo self-testu HAL, pętli UI i Wi-Fi. Niedostępność HA sama nie powoduje rollbacku. Nie potwierdzaj obrazu jako `VALID` bez tego testu.
 - Nie wykonuj `git commit` ani `git push` bez wyraźnego polecenia użytkownika.
 
@@ -44,4 +46,4 @@
 - Rozwiązano stack overflow `sys_evt` podczas skanowania Wi-Fi przez uruchamianie `HandleScanResult()` w tasku `wifi_scan_result`.
 - Rozwiązano stack overflow `sys_evt` podczas uruchamiania NTP przez uruchamianie inicjalizacji w osobnym tasku.
 - Pierwszy etap `ha_client` obejmuje połączenie WebSocket i autoryzację; obsługa encji, usług i UI pozostaje do wykonania.
-- `ha_ota` przygotowuje pobieranie HTTPS i automatyczny rollback; wyzwalanie aktualizacji oraz UI OTA nie są jeszcze podłączone.
+- `ha_client` subskrybuje event OTA po auth i ponawia subskrypcję po reconnect. Pierwsze rzeczywiste OTA `ota_0 → ota_1` przeszło test sprzętowy: `PENDING_VERIFY → VALID`, ponowny start z `ota_1 VALID` oraz stabilna praca HA. UI OTA nie jest jeszcze podłączone; USB pozostaje recovery.

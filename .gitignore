@@ -65,3 +65,5 @@ obj/
 sdkconfig
 sdkconfig.old
 main/hal/ha_secrets.h
+main/hal/ha_ota_ca.h
+/local_ota/

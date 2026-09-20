@@ -4,17 +4,24 @@
 #include <cstdlib>
 #include <cstring>
 
-#include <esp_crt_bundle.h>
 #include <esp_http_client.h>
 #include <esp_https_ota.h>
 #include <esp_log.h>
 #include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <lwip/inet.h>
+#include <mbedtls/sha256.h>
 
 #include "ha_wifi.h"
+
+#if __has_include("ha_ota_ca.h")
+#include "ha_ota_ca.h"
+#else
+#define HA_OTA_CA_PEM ""
+#endif
 
 namespace ha_ota {
 namespace {
@@ -25,11 +32,12 @@ constexpr uint32_t kLoopStableMs = 10000;
 constexpr uint32_t kWifiStableMs = 5000;
 constexpr uint32_t kHeartbeatMaxAgeMs = 2000;
 constexpr size_t kMaxUrlLength = 512;
-constexpr size_t kMaxCertificateLength = 8192;
+constexpr size_t kSha256HexLength = 64;
 
 struct UpdateRequest {
     char* url;
-    char* ca_cert_pem;
+    size_t expected_size;
+    uint8_t expected_sha256[32];
 };
 
 std::atomic<Phase> current_phase{Phase::NotInitialized};
@@ -122,8 +130,45 @@ void free_request(UpdateRequest* request)
 {
     if (!request) return;
     free(request->url);
-    free(request->ca_cert_pem);
     free(request);
+}
+
+int hex_digit(char value)
+{
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+bool decode_sha256(const char* hex, uint8_t* output)
+{
+    if (!hex || strlen(hex) != kSha256HexLength) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        const int high = hex_digit(hex[2 * i]);
+        const int low = hex_digit(hex[2 * i + 1]);
+        if (high < 0 || low < 0) return false;
+        output[i] = static_cast<uint8_t>((high << 4) | low);
+    }
+    return true;
+}
+
+bool verify_partition_sha256(const esp_partition_t* partition, size_t size,
+                             const uint8_t* expected)
+{
+    mbedtls_sha256_context context;
+    mbedtls_sha256_init(&context);
+    bool ok = mbedtls_sha256_starts(&context, 0) == 0;
+    uint8_t buffer[1024];
+    for (size_t offset = 0; ok && offset < size; offset += sizeof(buffer)) {
+        const size_t length = size - offset < sizeof(buffer) ? size - offset : sizeof(buffer);
+        ok = esp_partition_read(partition, offset, buffer, length) == ESP_OK &&
+             mbedtls_sha256_update(&context, buffer, length) == 0;
+    }
+    uint8_t actual[32]{};
+    if (ok) ok = mbedtls_sha256_finish(&context, actual) == 0;
+    mbedtls_sha256_free(&context);
+    return ok && memcmp(actual, expected, sizeof(actual)) == 0;
 }
 
 void update_task(void* parameter)
@@ -136,21 +181,26 @@ void update_task(void* parameter)
         vTaskDelete(nullptr);
         return;
     }
-    ESP_LOGI(kTag, "Updating inactive partition: %s", target->label);
+    if (request->expected_size > target->size) {
+        fail(Error::ImageTooLarge, "OTA image exceeds inactive partition");
+        free_request(request);
+        vTaskDelete(nullptr);
+        return;
+    }
+    ESP_LOGI(kTag, "OTA target partition: %s", target->label);
+    ESP_LOGI(kTag, "OTA URL: %s", request->url);  // URL has no query or userinfo.
+    ESP_LOGI(kTag, "OTA expected image size: %u", static_cast<unsigned>(request->expected_size));
 
     esp_http_client_config_t http_config{};
     http_config.url = request->url;
     http_config.timeout_ms = 15000;
     http_config.buffer_size = 4096;
     http_config.disable_auto_redirect = true;
-    if (request->ca_cert_pem) {
-        http_config.cert_pem = request->ca_cert_pem;
-    } else {
-        http_config.crt_bundle_attach = esp_crt_bundle_attach;
-    }
+    http_config.cert_pem = HA_OTA_CA_PEM;
     esp_https_ota_config_t ota_config{};
     ota_config.http_config = &http_config;
 
+    ESP_LOGI(kTag, "OTA download started");
     esp_https_ota_handle_t handle = nullptr;
     esp_err_t result = esp_https_ota_begin(&ota_config, &handle);
     if (result != ESP_OK) {
@@ -161,21 +211,27 @@ void update_task(void* parameter)
     }
 
     const int image_size = esp_https_ota_get_image_size(handle);
-    if (image_size > 0 && static_cast<size_t>(image_size) > target->size) {
+    if (image_size > 0 && static_cast<size_t>(image_size) != request->expected_size) {
         esp_https_ota_abort(handle);
-        fail(Error::ImageTooLarge, "OTA image exceeds inactive partition");
+        fail(Error::SizeMismatch, "OTA Content-Length differs from request size");
         free_request(request);
         vTaskDelete(nullptr);
         return;
     }
 
+    int last_logged_percent = 0;
     do {
         result = esp_https_ota_perform(handle);
         const int bytes_read = esp_https_ota_get_image_len_read(handle);
-        if (image_size > 0 && bytes_read >= 0) {
-            const int percent = bytes_read >= image_size ? 100 :
-                                static_cast<int>((static_cast<int64_t>(bytes_read) * 100) / image_size);
+        if (bytes_read >= 0) {
+            const int percent = static_cast<size_t>(bytes_read) >= request->expected_size ? 100 :
+                                static_cast<int>((static_cast<int64_t>(bytes_read) * 100) /
+                                                 request->expected_size);
             current_progress.store(static_cast<uint8_t>(percent));
+            if (percent >= last_logged_percent + 10 || percent == 100) {
+                ESP_LOGI(kTag, "OTA progress: %d%%", percent);
+                last_logged_percent = percent;
+            }
         }
     } while (result == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
 
@@ -193,6 +249,23 @@ void update_task(void* parameter)
         vTaskDelete(nullptr);
         return;
     }
+    const int bytes_read = esp_https_ota_get_image_len_read(handle);
+    if (bytes_read < 0 || static_cast<size_t>(bytes_read) != request->expected_size) {
+        esp_https_ota_abort(handle);
+        fail(Error::SizeMismatch, "OTA downloaded byte count differs from request size");
+        free_request(request);
+        vTaskDelete(nullptr);
+        return;
+    }
+    ESP_LOGI(kTag, "OTA image size verified");
+    if (!verify_partition_sha256(target, request->expected_size, request->expected_sha256)) {
+        esp_https_ota_abort(handle);
+        fail(Error::HashMismatch, "OTA SHA-256 mismatch or flash read error");
+        free_request(request);
+        vTaskDelete(nullptr);
+        return;
+    }
+    ESP_LOGI(kTag, "OTA SHA-256 verified");
 
     // finish validates the image and changes otadata only after success.
     result = esp_https_ota_finish(handle);
@@ -203,9 +276,11 @@ void update_task(void* parameter)
         return;
     }
 
+    ESP_LOGI(kTag, "OTA image validated");
+    ESP_LOGI(kTag, "OTA boot partition changed: %s", target->label);
     current_progress.store(100);
     current_phase.store(Phase::Switching);
-    ESP_LOGI(kTag, "OTA image verified; restarting into %s", target->label);
+    ESP_LOGI(kTag, "OTA rebooting");
     free_request(request);
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
@@ -254,31 +329,27 @@ void heartbeat()
     }
 }
 
-bool start_update(const char* url, const char* ca_cert_pem)
+bool is_valid_url(const char* url)
 {
     if (!url || strncmp(url, "https://", 8) != 0 || strlen(url) <= 8 ||
         strlen(url) > kMaxUrlLength || strchr(url, '#') || strchr(url, '?')) {
-        current_error.store(Error::InvalidUrl);
         return false;
     }
     const char* authority_end = strchr(url + 8, '/');
     if (!authority_end) authority_end = url + strlen(url);
     if (memchr(url + 8, '@', authority_end - (url + 8)) != nullptr) {
-        current_error.store(Error::InvalidUrl);  // No credentials in URLs.
         return false;
     }
     // An IP literal cannot resolve to a public address or be DNS-rebound.
     const char* port = static_cast<const char*>(memchr(url + 8, ':', authority_end - (url + 8)));
     const size_t host_length = (port ? port : authority_end) - (url + 8);
     if (host_length == 0 || host_length > 15 || (port && port + 1 == authority_end)) {
-        current_error.store(Error::InvalidUrl);
         return false;
     }
     char host[16]{};
     memcpy(host, url + 8, host_length);
     in_addr address{};
     if (inet_pton(AF_INET, host, &address) != 1) {
-        current_error.store(Error::NonLocalUrl);
         return false;
     }
     const uint32_t ip = ntohl(address.s_addr);
@@ -286,29 +357,51 @@ bool start_update(const char* url, const char* ca_cert_pem)
                             (ip & 0xfff00000U) == 0xac100000U ||
                             (ip & 0xffff0000U) == 0xc0a80000U;
     if (!private_ip) {
-        current_error.store(Error::NonLocalUrl);
         return false;
     }
     if (port) {
         unsigned int port_number = 0;
         for (const char* digit = port + 1; digit < authority_end; ++digit) {
             if (*digit < '0' || *digit > '9') {
-                current_error.store(Error::InvalidUrl);
                 return false;
             }
             port_number = port_number * 10 + static_cast<unsigned int>(*digit - '0');
             if (port_number > 65535) {
-                current_error.store(Error::InvalidUrl);
                 return false;
             }
         }
         if (port_number == 0) {
-            current_error.store(Error::InvalidUrl);
             return false;
         }
     }
-    if (ca_cert_pem && strlen(ca_cert_pem) > kMaxCertificateLength) {
+    return true;
+}
+
+size_t next_partition_size()
+{
+    const esp_partition_t* partition = esp_ota_get_next_update_partition(nullptr);
+    return partition ? partition->size : 0;
+}
+
+bool start_update(const char* url, const char* expected_sha256, size_t expected_size)
+{
+    if (!is_valid_url(url)) {
         current_error.store(Error::InvalidUrl);
+        return false;
+    }
+    uint8_t expected_digest[32]{};
+    if (!decode_sha256(expected_sha256, expected_digest) || expected_size == 0) {
+        current_error.store(Error::InvalidImageMetadata);
+        return false;
+    }
+    if (HA_OTA_CA_PEM[0] == '\0') {
+        current_error.store(Error::NoTrustedCa);
+        ESP_LOGE(kTag, "OTA CA certificate is not configured");
+        return false;
+    }
+    const size_t partition_size = next_partition_size();
+    if (partition_size == 0 || expected_size > partition_size) {
+        current_error.store(partition_size == 0 ? Error::NoUpdatePartition : Error::ImageTooLarge);
         return false;
     }
     if (!ha_wifi::is_connected()) {
@@ -331,9 +424,10 @@ bool start_update(const char* url, const char* ca_cert_pem)
     auto* request = static_cast<UpdateRequest*>(calloc(1, sizeof(UpdateRequest)));
     if (request) {
         request->url = strdup(url);
-        if (ca_cert_pem) request->ca_cert_pem = strdup(ca_cert_pem);
+        request->expected_size = expected_size;
+        memcpy(request->expected_sha256, expected_digest, sizeof(expected_digest));
     }
-    if (!request || !request->url || (ca_cert_pem && !request->ca_cert_pem)) {
+    if (!request || !request->url) {
         free_request(request);
         fail(Error::OutOfMemory, "OTA request allocation failed");
         return false;

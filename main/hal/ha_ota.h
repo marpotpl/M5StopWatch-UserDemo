@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 namespace ha_ota {
 
@@ -17,13 +18,17 @@ enum class Phase : uint8_t {
 enum class Error : uint8_t {
     None,
     InvalidUrl,
+    InvalidImageMetadata,
     NonLocalUrl,
+    NoTrustedCa,
     Busy,
     WifiUnavailable,
     NoUpdatePartition,
     OutOfMemory,
     TaskStartFailed,
     ImageTooLarge,
+    SizeMismatch,
+    HashMismatch,
     DownloadFailed,
     IncompleteImage,
     ValidationFailed,
@@ -45,11 +50,13 @@ bool init();
 void report_boot_ready();
 void heartbeat();
 
-// Starts a background HTTPS download to the inactive slot. The default uses
-// the ESP-IDF certificate bundle; ca_cert_pem can supply a private LAN CA.
-// URL must point to a private IPv4 address on the trusted local network.
-// The caller must also protect the trigger from unauthorized use.
-bool start_update(const char* url, const char* ca_cert_pem = nullptr);
+// The trusted CA is compiled from the Git-ignored ha_ota_ca.h. Event data
+// cannot choose or replace it. URL must point to a private IPv4 address.
+bool start_update(const char* url, const char* expected_sha256, size_t expected_size);
+
+// Read-only checks for a caller validating a request before starting OTA.
+bool is_valid_url(const char* url);
+size_t next_partition_size();
 
 // Only meaningful for a running image in PENDING_VERIFY state.
 void request_rollback();

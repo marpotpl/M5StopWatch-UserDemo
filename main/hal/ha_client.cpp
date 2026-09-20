@@ -1,6 +1,8 @@
 #include "ha_client.h"
 
 #include <atomic>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -13,6 +15,7 @@
 #include <freertos/task.h>
 
 #include "ha_secrets.h"
+#include "ha_ota.h"
 #include "ha_wifi.h"
 
 #ifndef HA_ACCESS_TOKEN
@@ -28,6 +31,11 @@ constexpr size_t kChunkSize = 512;
 constexpr size_t kMaxMessageSize = 4096;
 constexpr uint32_t kAuthTimeoutMs = 15000;
 constexpr uint32_t kMaxRetryMs = 30000;
+constexpr int kOtaSubscriptionId = 1;
+constexpr char kOtaEventType[] = "m5stopwatch_ota_request";
+constexpr char kDeviceId[] = "m5stopwatch";
+constexpr size_t kMaxRequestIdLength = 64;
+constexpr size_t kRememberedRequests = 32;
 
 enum class EventType : uint8_t { Begin, BeforeConnect, Connected, Disconnected, Error, Closed, Finish, Data };
 
@@ -46,6 +54,47 @@ struct Event {
 std::atomic<State> current_state{State::Stopped};
 std::atomic<bool> queue_overflow{false};
 QueueHandle_t event_queue = nullptr;
+std::array<std::array<char, kMaxRequestIdLength + 1>, kRememberedRequests> accepted_request_ids{};
+size_t accepted_request_count = 0;
+
+bool valid_request_id(const char* id)
+{
+    if (!id) return false;
+    const size_t length = strnlen(id, kMaxRequestIdLength + 1);
+    if (length == 0 || length > kMaxRequestIdLength) return false;
+    for (size_t i = 0; i < length; ++i) {
+        const char c = id[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool valid_sha256(const char* hex)
+{
+    if (!hex || strlen(hex) != 64) return false;
+    for (size_t i = 0; i < 64; ++i) {
+        const char c = hex[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
+}
+
+bool request_id_seen(const char* id)
+{
+    for (size_t i = 0; i < accepted_request_count; ++i) {
+        if (strcmp(accepted_request_ids[i].data(), id) == 0) return true;
+    }
+    return false;
+}
+
+void remember_request_id(const char* id)
+{
+    strcpy(accepted_request_ids[accepted_request_count++].data(), id);
+}
 
 void websocket_event(void*, esp_event_base_t, int32_t event_id, void* event_data)
 {
@@ -151,14 +200,95 @@ bool send_auth(esp_websocket_client_handle_t client, uint32_t connected_at_ms)
     return ok;
 }
 
+bool send_ota_subscription(esp_websocket_client_handle_t client)
+{
+    constexpr char message[] =
+        "{\"id\":1,\"type\":\"subscribe_events\",\"event_type\":\"m5stopwatch_ota_request\"}";
+    return esp_websocket_client_send_text(client, message, sizeof(message) - 1,
+                                          pdMS_TO_TICKS(5000)) == sizeof(message) - 1;
+}
+
+bool handle_authenticated_message(const std::string& message, bool& subscription_active)
+{
+    cJSON* json = cJSON_ParseWithLength(message.data(), message.size());
+    if (!json) {
+        ESP_LOGW(kTag, "Invalid Home Assistant message after auth");
+        return true;
+    }
+    const cJSON* type = cJSON_GetObjectItemCaseSensitive(json, "type");
+    const cJSON* id = cJSON_GetObjectItemCaseSensitive(json, "id");
+    if (!cJSON_IsString(type) || !cJSON_IsNumber(id) ||
+        id->valuedouble != kOtaSubscriptionId) {
+        cJSON_Delete(json);
+        return true;
+    }
+    if (strcmp(type->valuestring, "result") == 0) {
+        const cJSON* success = cJSON_GetObjectItemCaseSensitive(json, "success");
+        subscription_active = cJSON_IsTrue(success);
+        if (subscription_active) {
+            ESP_LOGI(kTag, "OTA event subscription active");
+        } else {
+            ESP_LOGE(kTag, "OTA event subscription rejected");
+        }
+        cJSON_Delete(json);
+        return subscription_active;
+    }
+    if (!subscription_active || strcmp(type->valuestring, "event") != 0) {
+        cJSON_Delete(json);
+        return true;
+    }
+    const cJSON* event = cJSON_GetObjectItemCaseSensitive(json, "event");
+    const cJSON* event_type = cJSON_GetObjectItemCaseSensitive(event, "event_type");
+    if (!cJSON_IsString(event_type) || strcmp(event_type->valuestring, kOtaEventType) != 0) {
+        cJSON_Delete(json);
+        return true;
+    }
+    ESP_LOGI(kTag, "OTA event received");
+    const cJSON* data = cJSON_GetObjectItemCaseSensitive(event, "data");
+    const cJSON* device_id = cJSON_GetObjectItemCaseSensitive(data, "device_id");
+    const cJSON* request_id = cJSON_GetObjectItemCaseSensitive(data, "request_id");
+    const cJSON* url = cJSON_GetObjectItemCaseSensitive(data, "url");
+    const cJSON* sha256 = cJSON_GetObjectItemCaseSensitive(data, "sha256");
+    const cJSON* size = cJSON_GetObjectItemCaseSensitive(data, "size");
+    if (!cJSON_IsString(device_id) || strcmp(device_id->valuestring, kDeviceId) != 0) {
+        ESP_LOGW(kTag, "OTA event ignored: wrong device_id");
+    } else if (!cJSON_IsString(request_id) || !valid_request_id(request_id->valuestring)) {
+        ESP_LOGW(kTag, "OTA event rejected: invalid request_id");
+    } else if (request_id_seen(request_id->valuestring)) {
+        ESP_LOGW(kTag, "OTA event ignored: duplicate request_id");
+    } else if (accepted_request_count == kRememberedRequests) {
+        ESP_LOGW(kTag, "OTA event rejected: request_id cache full");
+    } else if (!cJSON_IsString(url) || !ha_ota::is_valid_url(url->valuestring)) {
+        ESP_LOGW(kTag, "OTA event rejected: invalid local HTTPS URL");
+    } else if (!cJSON_IsString(sha256) || !valid_sha256(sha256->valuestring)) {
+        ESP_LOGW(kTag, "OTA event rejected: invalid SHA-256");
+    } else if (!cJSON_IsNumber(size) || !std::isfinite(size->valuedouble) ||
+               size->valuedouble <= 0 || std::floor(size->valuedouble) != size->valuedouble ||
+               ha_ota::next_partition_size() == 0 ||
+               size->valuedouble > static_cast<double>(ha_ota::next_partition_size())) {
+        ESP_LOGW(kTag, "OTA event rejected: image size exceeds target or is invalid");
+    } else {
+        const ha_ota::Phase phase = ha_ota::status().phase;
+        if (phase != ha_ota::Phase::Ready && phase != ha_ota::Phase::Failed) {
+            ESP_LOGW(kTag, "OTA event rejected: OTA is busy");
+        } else if (ha_ota::start_update(url->valuestring, sha256->valuestring,
+                                        static_cast<size_t>(size->valuedouble))) {
+            remember_request_id(request_id->valuestring);
+            ESP_LOGI(kTag, "OTA request accepted: %s", request_id->valuestring);
+        } else {
+            ESP_LOGW(kTag, "OTA event rejected: start_update error=%u",
+                     static_cast<unsigned>(ha_ota::status().error));
+        }
+    }
+    cJSON_Delete(json);
+    return true;
+}
+
 enum class AuthResult { Continue, Authenticated, Invalid, Retry };
 
 AuthResult handle_message(const std::string& message, esp_websocket_client_handle_t client,
                           bool& auth_sent, uint32_t connected_at_ms)
 {
-    if (current_state.load() == State::Authenticated) {
-        return AuthResult::Continue;  // No entity or service messages in this stage.
-    }
     cJSON* json = cJSON_ParseWithLength(message.data(), message.size());
     if (!json) {
         return AuthResult::Retry;
@@ -233,6 +363,7 @@ void client_task(void*)
     size_t frame_base = 0;
     bool in_text_message = false;
     bool auth_sent = false;
+    bool ota_subscription_active = false;
     bool auth_failed_latched = false;
     uint32_t retry_ms = 1000;
     TickType_t retry_at = 0;
@@ -253,6 +384,7 @@ void client_task(void*)
             retry_ms = 1000;
             in_text_message = false;
             auth_sent = false;
+            ota_subscription_active = false;
             vTaskDelay(pdMS_TO_TICKS(250));
             continue;
         }
@@ -312,12 +444,22 @@ void client_task(void*)
                             goto retry;
                         }
                         if (complete) {
-                            switch (handle_message(message, client, auth_sent, connected_at_ms)) {
+                            if (current_state.load() == State::Authenticated) {
+                                if (!handle_authenticated_message(message, ota_subscription_active)) {
+                                    goto retry;
+                                }
+                            } else {
+                                switch (handle_message(message, client, auth_sent, connected_at_ms)) {
                                 case AuthResult::Continue: break;
                                 case AuthResult::Authenticated:
                                     current_state.store(State::Authenticated);
                                     retry_ms = 1000;
                                     ESP_LOGI(kTag, "Home Assistant authenticated");
+                                    ota_subscription_active = false;
+                                    if (!send_ota_subscription(client)) {
+                                        ESP_LOGW(kTag, "OTA event subscription send failed");
+                                        goto retry;
+                                    }
                                     break;
                                 case AuthResult::Invalid:
                                     ESP_LOGE(kTag, "Home Assistant authentication rejected");
@@ -328,6 +470,7 @@ void client_task(void*)
                                 case AuthResult::Retry:
                                     ESP_LOGW(kTag, "Unexpected Home Assistant auth message");
                                     goto retry;
+                                }
                             }
                             message.clear();
                         }
@@ -354,6 +497,7 @@ void client_task(void*)
         frame_base = 0;
         in_text_message = false;
         auth_sent = false;
+        ota_subscription_active = false;
         current_state.store(State::RetryWait);
         retry_at = xTaskGetTickCount() + pdMS_TO_TICKS(retry_ms);
         retry_ms = retry_ms < kMaxRetryMs / 2 ? retry_ms * 2 : kMaxRetryMs;
