@@ -214,6 +214,11 @@ LauncherView::~LauncherView()
 void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
 {
     mclog::tagInfo(_tag, "init");
+    mclog::tagInfo(_tag, "visible app count: {}", appPorps.size());
+    for (std::size_t index = 0; index < appPorps.size(); ++index) {
+        mclog::tagInfo(_tag, "app[{}] id={} name={}", index, appPorps[index].appID,
+                       appPorps[index].info.name);
+    }
 
     _key_manager = std::make_unique<input::KeyManager>();
 
@@ -245,9 +250,9 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
             // Icon panel
             _icon_panels.push_back(std::make_unique<Container>(_panel->get()));
             _icon_panels.back()->setAlign(LV_ALIGN_CENTER);
-            const bool tesla_background = props.info.icon == (void*)&icon_tesla;
-            _icon_panels.back()->setSize(tesla_background ? 466 : 200, tesla_background ? 466 : 200);
-            _icon_panels.back()->setPos(icon_x, tesla_background ? 0 : icon_y);
+            const bool full_background = props.info.icon == (void*)&icon_tesla || props.info.icon == (void*)&icon_brama;
+            _icon_panels.back()->setSize(full_background ? 466 : 200, full_background ? 466 : 200);
+            _icon_panels.back()->setPos(icon_x, full_background ? 0 : icon_y);
             _icon_panels.back()->setBorderWidth(0);
             _icon_panels.back()->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
             _icon_panels.back()->setBgOpa(0);

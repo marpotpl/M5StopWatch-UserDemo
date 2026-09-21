@@ -39,17 +39,19 @@ extern "C" void app_main(void)
     ui_hal::on_get_tick([]() { return GetHAL().millis(); });
 
     // Install apps
-    GetMooncake().installApp(std::make_unique<AppLauncher>());
     GetMooncake().installApp(std::make_unique<AppAlarmClock>());
     GetMooncake().installApp(std::make_unique<AppWatchFace>());
     GetMooncake().installApp(std::make_unique<AppStopWatch>());
     GetMooncake().installApp(std::make_unique<AppTesla>());
+    GetMooncake().installApp(std::make_unique<AppBrama>());
     GetMooncake().installApp(std::make_unique<AppBadge>());
     GetMooncake().installApp(std::make_unique<AppImu>());
     GetMooncake().installApp(std::make_unique<AppFft>());
     GetMooncake().installApp(std::make_unique<AppLuckyWheel>());
     GetMooncake().installApp(std::make_unique<AppSetup>());
     // GetMooncake().installApp(std::make_unique<AppTemplate>());
+    // Register the launcher last so its one-time app list snapshot contains every app.
+    GetMooncake().installApp(std::make_unique<AppLauncher>());
 
     ha_ota::report_boot_ready();
 

@@ -15,3 +15,4 @@
 #include "app_lucky_wheel/app_lucky_wheel.h"
 #include "apps/app_alarm_clock/app_alarm_clock.h"
 #include "app_tesla/app_tesla.h"
+#include "app_brama/app_brama.h"

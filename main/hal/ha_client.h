@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 namespace ha_client {
 
@@ -18,5 +19,9 @@ bool init();
 State state();
 bool is_connected();
 bool is_authenticated();
+
+enum class ButtonPressStatus : uint8_t { Idle, Queued, Sending, Accepted, Failed, Offline };
+bool request_button_press(const char* entity_id);
+ButtonPressStatus button_press_status();
 
 }  // namespace ha_client

@@ -46,5 +46,6 @@ LV_IMG_DECLARE(big_number_9);
 
 // Tesla-only assets; existing applications retain their original fonts and icons.
 LV_IMG_DECLARE(icon_tesla);
+LV_IMG_DECLARE(icon_brama);
 LV_FONT_DECLARE(tesla_text_26);
 LV_FONT_DECLARE(tesla_text_32);

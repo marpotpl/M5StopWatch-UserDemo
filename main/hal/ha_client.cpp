@@ -60,6 +60,11 @@ std::atomic<bool> queue_overflow{false};
 QueueHandle_t event_queue = nullptr;
 std::array<std::array<char, kMaxRequestIdLength + 1>, kRememberedRequests> accepted_request_ids{};
 size_t accepted_request_count = 0;
+std::atomic<ButtonPressStatus> button_status{ButtonPressStatus::Idle};
+std::atomic<bool> button_request_pending{false};
+std::atomic<uint32_t> button_request_id{999};
+char button_entity[128]{};
+portMUX_TYPE button_lock = portMUX_INITIALIZER_UNLOCKED;
 
 bool valid_request_id(const char* id)
 {
@@ -243,6 +248,27 @@ bool send_tesla_command(esp_websocket_client_handle_t client)
     return ok;  // Never retry an uncertain physical operation.
 }
 
+bool send_button_command(esp_websocket_client_handle_t client)
+{
+    if (!button_request_pending.exchange(false)) return true;
+    const uint32_t id = button_request_id.load();
+    char entity[sizeof(button_entity)];
+    portENTER_CRITICAL(&button_lock);
+    memcpy(entity, button_entity, sizeof(entity));
+    portEXIT_CRITICAL(&button_lock);
+    char json[320];
+    const int length = snprintf(json, sizeof(json),
+        "{\"id\":%lu,\"type\":\"call_service\",\"domain\":\"button\",\"service\":\"press\","
+        "\"target\":{\"entity_id\":\"%s\"}}",
+        static_cast<unsigned long>(id), entity);
+    button_status.store(ButtonPressStatus::Sending);
+    const bool ok = length > 0 && length < static_cast<int>(sizeof(json)) &&
+        esp_websocket_client_send_text(client, json, length, pdMS_TO_TICKS(5000)) == length;
+    ESP_LOGI(kTag, "GATE: button.press %s", ok ? "sent" : "send failed");
+    if (!ok) button_status.store(ButtonPressStatus::Failed);
+    return ok;
+}
+
 bool handle_authenticated_message(const std::string& message,
                                   bool& ota_subscription_active, bool& tesla_subscription_active)
 {
@@ -283,9 +309,15 @@ bool handle_authenticated_message(const std::string& message,
             return tesla_subscription_active;
         }
         if (message_id >= 10) {
-            ha_tesla::command_result(static_cast<uint32_t>(message_id),
-                cJSON_IsTrue(success) ? ha_tesla::Command::Accepted : ha_tesla::Command::Failed);
-            ESP_LOGI(kTag, "Tesla call_service result id=%d success=%d", message_id, cJSON_IsTrue(success));
+            if (message_id >= 1000) {
+                const bool ok = cJSON_IsTrue(success);
+                button_status.store(ok ? ButtonPressStatus::Accepted : ButtonPressStatus::Failed);
+                ESP_LOGI(kTag, "GATE: HA service response %s", ok ? "OK" : "ERROR");
+            } else {
+                ha_tesla::command_result(static_cast<uint32_t>(message_id),
+                    cJSON_IsTrue(success) ? ha_tesla::Command::Accepted : ha_tesla::Command::Failed);
+                ESP_LOGI(kTag, "Tesla call_service result id=%d success=%d", message_id, cJSON_IsTrue(success));
+            }
         }
         cJSON_Delete(json);
         return true;
@@ -459,6 +491,8 @@ void client_task(void*)
         }
         if (!ha_wifi::is_connected()) {
             ha_tesla::set_online(false);
+            button_request_pending.store(false);
+            button_status.store(ButtonPressStatus::Offline);
             if (client) close_client(client);
             current_state.store(State::WaitingForWifi);
             retry_ms = 1000;
@@ -592,12 +626,16 @@ void client_task(void*)
             ESP_LOGW(kTag, "Home Assistant authentication timeout");
             goto retry;
         }
-        if (current_state.load() == State::Authenticated && tesla_subscription_active &&
-            !send_tesla_command(client)) goto retry;
+        if (current_state.load() == State::Authenticated) {
+            if (tesla_subscription_active && !send_tesla_command(client)) goto retry;
+            if (!send_button_command(client)) goto retry;
+        }
         continue;
 
     retry:
         ha_tesla::set_online(false);
+        button_request_pending.store(false);
+        button_status.store(ButtonPressStatus::Offline);
         close_client(client);
         message.clear();
         frame_base = 0;
@@ -638,5 +676,29 @@ bool is_connected()
 }
 
 bool is_authenticated() { return state() == State::Authenticated; }
+
+bool request_button_press(const char* entity_id)
+{
+    const bool authenticated = is_authenticated();
+    const auto status = button_status.load();
+    if (!authenticated || !entity_id || !*entity_id || button_request_pending.load() ||
+        status == ButtonPressStatus::Queued ||
+        status == ButtonPressStatus::Sending) {
+        button_status.store(authenticated ? ButtonPressStatus::Failed : ButtonPressStatus::Offline);
+        return false;
+    }
+    portENTER_CRITICAL(&button_lock);
+    strncpy(button_entity, entity_id, sizeof(button_entity) - 1);
+    button_entity[sizeof(button_entity) - 1] = '\0';
+    portEXIT_CRITICAL(&button_lock);
+    uint32_t id = button_request_id.load() + 1;
+    if (id < 1000) id = 1000;
+    button_request_id.store(id);
+    button_status.store(ButtonPressStatus::Queued);
+    button_request_pending.store(true);
+    return true;
+}
+
+ButtonPressStatus button_press_status() { return button_status.load(); }
 
 }  // namespace ha_client
