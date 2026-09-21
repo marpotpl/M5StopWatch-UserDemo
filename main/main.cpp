@@ -43,6 +43,7 @@ extern "C" void app_main(void)
     GetMooncake().installApp(std::make_unique<AppAlarmClock>());
     GetMooncake().installApp(std::make_unique<AppWatchFace>());
     GetMooncake().installApp(std::make_unique<AppStopWatch>());
+    GetMooncake().installApp(std::make_unique<AppTesla>());
     GetMooncake().installApp(std::make_unique<AppBadge>());
     GetMooncake().installApp(std::make_unique<AppImu>());
     GetMooncake().installApp(std::make_unique<AppFft>());

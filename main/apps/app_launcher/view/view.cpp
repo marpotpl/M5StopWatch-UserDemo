@@ -245,8 +245,9 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
             // Icon panel
             _icon_panels.push_back(std::make_unique<Container>(_panel->get()));
             _icon_panels.back()->setAlign(LV_ALIGN_CENTER);
-            _icon_panels.back()->setSize(200, 200);
-            _icon_panels.back()->setPos(icon_x, icon_y);
+            const bool tesla_background = props.info.icon == (void*)&icon_tesla;
+            _icon_panels.back()->setSize(tesla_background ? 466 : 200, tesla_background ? 466 : 200);
+            _icon_panels.back()->setPos(icon_x, tesla_background ? 0 : icon_y);
             _icon_panels.back()->setBorderWidth(0);
             _icon_panels.back()->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
             _icon_panels.back()->setBgOpa(0);

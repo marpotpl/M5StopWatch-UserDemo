@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -16,6 +17,8 @@
 
 #include "ha_secrets.h"
 #include "ha_ota.h"
+#include "ha_tesla.h"
+#include "ha_tesla_rest.h"
 #include "ha_wifi.h"
 
 #ifndef HA_ACCESS_TOKEN
@@ -28,10 +31,11 @@ namespace {
 constexpr char kUrl[] = "ws://192.168.0.73:8123/api/websocket";
 constexpr char kTag[] = "HA_CLIENT";
 constexpr size_t kChunkSize = 512;
-constexpr size_t kMaxMessageSize = 4096;
+constexpr size_t kMaxMessageSize = 32768;
 constexpr uint32_t kAuthTimeoutMs = 15000;
 constexpr uint32_t kMaxRetryMs = 30000;
 constexpr int kOtaSubscriptionId = 1;
+constexpr int kTeslaSubscriptionId = 3;
 constexpr char kOtaEventType[] = "m5stopwatch_ota_request";
 constexpr char kDeviceId[] = "m5stopwatch";
 constexpr size_t kMaxRequestIdLength = 64;
@@ -208,7 +212,39 @@ bool send_ota_subscription(esp_websocket_client_handle_t client)
                                           pdMS_TO_TICKS(5000)) == sizeof(message) - 1;
 }
 
-bool handle_authenticated_message(const std::string& message, bool& subscription_active)
+bool send_tesla_subscription(esp_websocket_client_handle_t client)
+{
+    constexpr char message[] =
+        "{\"id\":3,\"type\":\"subscribe_events\",\"event_type\":\"state_changed\"}";
+    return esp_websocket_client_send_text(client, message, sizeof(message) - 1,
+                                          pdMS_TO_TICKS(5000)) == sizeof(message) - 1;
+}
+
+bool send_tesla_command(esp_websocket_client_handle_t client)
+{
+    ha_tesla::poll_timeout();
+    ha_tesla::Action action;
+    uint32_t id;
+    if (!ha_tesla::take_command(action, id)) return true;
+    const bool cover = action == ha_tesla::Action::OpenTrunk || action == ha_tesla::Action::CloseTrunk;
+    const char* service = action == ha_tesla::Action::OpenTrunk ? "open_cover" :
+                          action == ha_tesla::Action::CloseTrunk ? "close_cover" :
+                          action == ha_tesla::Action::ClimateOn ? "turn_on" : "turn_off";
+    char json[256];
+    const int length = snprintf(json, sizeof(json),
+        "{\"id\":%lu,\"type\":\"call_service\",\"domain\":\"%s\",\"service\":\"%s\","
+        "\"target\":{\"entity_id\":\"%s\"}}",
+        static_cast<unsigned long>(id), cover ? "cover" : "climate", service,
+        ha_tesla::entity_id(cover ? ha_tesla::Entity::Trunk : ha_tesla::Entity::Climate));
+    const bool ok = length > 0 && length < static_cast<int>(sizeof(json)) &&
+        esp_websocket_client_send_text(client, json, length, pdMS_TO_TICKS(5000)) == length;
+    ESP_LOGI(kTag, "Tesla call_service id=%lu %s", static_cast<unsigned long>(id), ok ? "sent" : "send failed");
+    if (!ok) ha_tesla::command_result(id, ha_tesla::Command::Failed);
+    return ok;  // Never retry an uncertain physical operation.
+}
+
+bool handle_authenticated_message(const std::string& message,
+                                  bool& ota_subscription_active, bool& tesla_subscription_active)
 {
     cJSON* json = cJSON_ParseWithLength(message.data(), message.size());
     if (!json) {
@@ -217,28 +253,69 @@ bool handle_authenticated_message(const std::string& message, bool& subscription
     }
     const cJSON* type = cJSON_GetObjectItemCaseSensitive(json, "type");
     const cJSON* id = cJSON_GetObjectItemCaseSensitive(json, "id");
-    if (!cJSON_IsString(type) || !cJSON_IsNumber(id) ||
-        id->valuedouble != kOtaSubscriptionId) {
+    if (!cJSON_IsString(type) || !cJSON_IsNumber(id)) {
         cJSON_Delete(json);
         return true;
     }
+    const int message_id = id->valueint;
     if (strcmp(type->valuestring, "result") == 0) {
         const cJSON* success = cJSON_GetObjectItemCaseSensitive(json, "success");
-        subscription_active = cJSON_IsTrue(success);
-        if (subscription_active) {
-            ESP_LOGI(kTag, "OTA event subscription active");
-        } else {
-            ESP_LOGE(kTag, "OTA event subscription rejected");
+        if (message_id == kOtaSubscriptionId) {
+            ota_subscription_active = cJSON_IsTrue(success);
+            if (ota_subscription_active) ESP_LOGI(kTag, "OTA event subscription active");
+            else ESP_LOGE(kTag, "OTA event subscription rejected");
+            cJSON_Delete(json);
+            return ota_subscription_active;
+        }
+        if (message_id == kTeslaSubscriptionId) {
+            tesla_subscription_active = cJSON_IsTrue(success);
+            if (tesla_subscription_active) {
+                ESP_LOGI(kTag, "Tesla state_changed subscription active");
+                if (!ha_tesla_rest::request_initial()) {
+                    ESP_LOGE(kTag, "Tesla initial REST task unavailable");
+                    cJSON_Delete(json);
+                    return false;
+                }
+            } else {
+                ESP_LOGE(kTag, "Tesla state_changed subscription rejected");
+            }
+            cJSON_Delete(json);
+            return tesla_subscription_active;
+        }
+        if (message_id >= 10) {
+            ha_tesla::command_result(static_cast<uint32_t>(message_id),
+                cJSON_IsTrue(success) ? ha_tesla::Command::Accepted : ha_tesla::Command::Failed);
+            ESP_LOGI(kTag, "Tesla call_service result id=%d success=%d", message_id, cJSON_IsTrue(success));
         }
         cJSON_Delete(json);
-        return subscription_active;
+        return true;
     }
-    if (!subscription_active || strcmp(type->valuestring, "event") != 0) {
+    if (strcmp(type->valuestring, "event") != 0) {
         cJSON_Delete(json);
         return true;
     }
     const cJSON* event = cJSON_GetObjectItemCaseSensitive(json, "event");
     const cJSON* event_type = cJSON_GetObjectItemCaseSensitive(event, "event_type");
+    if (message_id == kTeslaSubscriptionId && tesla_subscription_active &&
+        cJSON_IsString(event_type) && strcmp(event_type->valuestring, "state_changed") == 0) {
+        const cJSON* data = cJSON_GetObjectItemCaseSensitive(event, "data");
+        const cJSON* entity_id = cJSON_GetObjectItemCaseSensitive(data, "entity_id");
+        if (cJSON_IsString(entity_id)) {
+            for (auto entity : {ha_tesla::Entity::Soc, ha_tesla::Entity::Trunk, ha_tesla::Entity::Climate, ha_tesla::Entity::Location, ha_tesla::Entity::Odometer}) {
+                if (strcmp(entity_id->valuestring, ha_tesla::entity_id(entity)) != 0) continue;
+                const cJSON* value = cJSON_GetObjectItemCaseSensitive(
+                    cJSON_GetObjectItemCaseSensitive(data, "new_state"), "state");
+                ha_tesla::update(entity, cJSON_IsString(value) ? value->valuestring : nullptr);
+                ESP_LOGI(kTag, "Tesla state_changed %s applied", ha_tesla::entity_id(entity));
+            }
+        }
+        cJSON_Delete(json);
+        return true;
+    }
+    if (message_id != kOtaSubscriptionId || !ota_subscription_active) {
+        cJSON_Delete(json);
+        return true;
+    }
     if (!cJSON_IsString(event_type) || strcmp(event_type->valuestring, kOtaEventType) != 0) {
         cJSON_Delete(json);
         return true;
@@ -364,6 +441,8 @@ void client_task(void*)
     bool in_text_message = false;
     bool auth_sent = false;
     bool ota_subscription_active = false;
+    bool tesla_subscription_active = false;
+    bool skip_large_message = false;
     bool auth_failed_latched = false;
     uint32_t retry_ms = 1000;
     TickType_t retry_at = 0;
@@ -379,12 +458,16 @@ void client_task(void*)
             continue;  // Bad token: do not retry until the device is restarted.
         }
         if (!ha_wifi::is_connected()) {
+            ha_tesla::set_online(false);
             if (client) close_client(client);
             current_state.store(State::WaitingForWifi);
             retry_ms = 1000;
             in_text_message = false;
             auth_sent = false;
             ota_subscription_active = false;
+            tesla_subscription_active = false;
+            skip_large_message = false;
+            ha_tesla::set_online(false);
             vTaskDelay(pdMS_TO_TICKS(250));
             continue;
         }
@@ -435,9 +518,21 @@ void client_task(void*)
                         ESP_LOGI(kTag, "WebSocket event: FINISH");
                         break;
                     case EventType::Data: {
-                        ESP_LOGI(kTag, "WebSocket event: DATA opcode=0x%02x data_len=%d payload_len=%d payload_offset=%d fin=%d",
-                                 event.opcode, event.data_len, event.payload_len,
-                                 event.payload_offset, event.fin);
+                        if (skip_large_message) {
+                            if (event.payload_offset + event.data_len == event.payload_len && event.fin) {
+                                skip_large_message = false;
+                            }
+                            break;
+                        }
+                        if (event.opcode == 0x1 && event.payload_offset == 0 &&
+                            event.payload_len > static_cast<int>(kMaxMessageSize)) {
+                            ESP_LOGW(kTag, "Skipping oversized HA event");
+                            skip_large_message = true;
+                            if (event.payload_offset + event.data_len == event.payload_len && event.fin) {
+                                skip_large_message = false;
+                            }
+                            break;
+                        }
                         bool complete = false;
                         if (!append_frame(event, message, frame_base, in_text_message, complete)) {
                             ESP_LOGW(kTag, "Invalid or oversized WebSocket message");
@@ -445,7 +540,9 @@ void client_task(void*)
                         }
                         if (complete) {
                             if (current_state.load() == State::Authenticated) {
-                                if (!handle_authenticated_message(message, ota_subscription_active)) {
+                                if (!handle_authenticated_message(message,
+                                                                  ota_subscription_active,
+                                                                  tesla_subscription_active)) {
                                     goto retry;
                                 }
                             } else {
@@ -453,11 +550,17 @@ void client_task(void*)
                                 case AuthResult::Continue: break;
                                 case AuthResult::Authenticated:
                                     current_state.store(State::Authenticated);
+                                    ha_tesla::set_online(true);
                                     retry_ms = 1000;
                                     ESP_LOGI(kTag, "Home Assistant authenticated");
                                     ota_subscription_active = false;
+                                    tesla_subscription_active = false;
                                     if (!send_ota_subscription(client)) {
                                         ESP_LOGW(kTag, "OTA event subscription send failed");
+                                        goto retry;
+                                    }
+                                    if (!send_tesla_subscription(client)) {
+                                        ESP_LOGW(kTag, "Tesla event subscription send failed");
                                         goto retry;
                                     }
                                     break;
@@ -489,15 +592,21 @@ void client_task(void*)
             ESP_LOGW(kTag, "Home Assistant authentication timeout");
             goto retry;
         }
+        if (current_state.load() == State::Authenticated && tesla_subscription_active &&
+            !send_tesla_command(client)) goto retry;
         continue;
 
     retry:
+        ha_tesla::set_online(false);
         close_client(client);
         message.clear();
         frame_base = 0;
         in_text_message = false;
         auth_sent = false;
         ota_subscription_active = false;
+        tesla_subscription_active = false;
+        skip_large_message = false;
+        ha_tesla::set_online(false);
         current_state.store(State::RetryWait);
         retry_at = xTaskGetTickCount() + pdMS_TO_TICKS(retry_ms);
         retry_ms = retry_ms < kMaxRetryMs / 2 ? retry_ms * 2 : kMaxRetryMs;
@@ -509,7 +618,8 @@ void client_task(void*)
 bool init()
 {
     if (event_queue) return true;
-    event_queue = xQueueCreate(8, sizeof(Event));
+    if (!ha_tesla_rest::init()) return false;
+    event_queue = xQueueCreate(32, sizeof(Event));
     if (!event_queue) return false;
     if (xTaskCreate(client_task, "ha_client", 8192, nullptr, 5, nullptr) != pdPASS) {
         vQueueDelete(event_queue);
